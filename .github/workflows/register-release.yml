@@ -1,15 +1,23 @@
 name: Register release in update manifest
 
 # Wires the Tauri auto-updater. When a release is published in THIS public
-# repo, read its `latest.json` (Tauri's updater manifest — already carries the
-# correct public asset URL + minisign signature per platform) and register each
-# platform with the `release_manifest_v1` backend via the
-# `register_release_version` RPC. `p_make_live: true` bumps the channel's
-# latest_version so clients begin updating.
+# repo, read its `latest.json` (Tauri's updater manifest) for the per-platform
+# minisign signature, RE-RESOLVE the download URL against this release's own
+# published assets, and register each platform with the `release_manifest_v1`
+# backend via the `register_release_version` RPC. `p_make_live: true` bumps the
+# channel's latest_version so clients begin updating.
 #
 # Why here (the public repo) and not the private build repo: the updater needs
 # PUBLIC, client-downloadable URLs. Those live here. The private repo's release
 # assets aren't downloadable by end users.
+#
+# IMPORTANT: the `url` inside latest.json is NOT trusted. tauri-action bakes it
+# with the BUILD repo's asset URL (the private aurum-life-desktop repo), which
+# 404s for end users. So we register the URL of the matching asset ON THIS
+# release instead (see the re-resolve step below). Trusting the embedded URL is
+# exactly what shipped a manifest full of 404 links for v0.1.17 until it was
+# hand-patched. The signature is still read from latest.json — it signs the file
+# bytes, which are identical whichever repo hosts them.
 #
 # Required repo config (Settings → Secrets and variables → Actions):
 #   - Variable  SUPABASE_URL                 e.g. https://sftppbnqlsumjlrgyzgo.supabase.co
@@ -78,8 +86,29 @@ jobs:
             exit 1
           fi
           while IFS= read -r PLATFORM; do
-            URL=$(jq -r --arg p "${PLATFORM}" '.platforms[$p].url' <<<"${LATEST}")
+            EMBEDDED_URL=$(jq -r --arg p "${PLATFORM}" '.platforms[$p].url' <<<"${LATEST}")
             SIG=$(jq -r --arg p "${PLATFORM}" '.platforms[$p].signature' <<<"${LATEST}")
+
+            # ── Re-resolve the download URL against THIS release's assets ──
+            # The `url` baked into latest.json points at whatever repo *built*
+            # the bundle — that's tauri-action in the PRIVATE build repo
+            # (aurum-life-desktop), whose release assets 404 for end users.
+            # This public repo is where the installers are actually published
+            # and downloadable, so register the URL of the matching asset ON
+            # THIS RELEASE instead of trusting latest.json's embedded URL.
+            #
+            # This is the fix for the class of bug where the manifest served a
+            # build-repo URL and every client's auto-update 404'd. Match by the
+            # asset filename (the tail of the embedded URL); the file contents
+            # (hence the minisign SIG) are identical across repos, so the
+            # signature is still taken from latest.json.
+            ASSET_NAME=$(basename "${EMBEDDED_URL}")
+            URL=$(jq -r --arg n "${ASSET_NAME}" \
+              '.assets[] | select(.name == $n) | .browser_download_url' <<<"${REL}" | head -1)
+            if [[ -z "${URL}" || "${URL}" == "null" ]]; then
+              echo "::error::latest.json references asset '${ASSET_NAME}' (platform '${PLATFORM}'), but no such asset is attached to release ${TAG} in ${REPO}. The installer was not published to this repo — refusing to register a URL that would 404 for clients."
+              exit 1
+            fi
             echo "  registering ${PLATFORM} → ${URL}"
             curl -fsS -X POST \
               "${SUPABASE_URL}/rest/v1/rpc/register_release_version" \
