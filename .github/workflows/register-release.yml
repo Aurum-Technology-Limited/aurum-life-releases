@@ -102,14 +102,50 @@ jobs:
             # asset filename (the tail of the embedded URL); the file contents
             # (hence the minisign SIG) are identical across repos, so the
             # signature is still taken from latest.json.
+            # Strategy 1: the tail of the embedded URL is a filename. True only
+            # when tauri-action bakes a browser_download_url.
             ASSET_NAME=$(basename "${EMBEDDED_URL}")
             URL=$(jq -r --arg n "${ASSET_NAME}" \
               '.assets[] | select(.name == $n) | .browser_download_url' <<<"${REL}" | head -1)
+            HOW="filename from latest.json url"
+
+            # Strategy 2: tauri-action now bakes GitHub *API* urls
+            # (…/releases/assets/502992182), so basename yields a numeric asset
+            # id that matches no filename and strategy 1 always fails. That is
+            # not hypothetical — it silently broke registration for v0.1.33 and
+            # v0.1.34, and each time the release sat published-but-unregistered
+            # until someone noticed and ran the RPC by hand. A release nobody
+            # remembers to hand-register is the v0.1.1–v0.1.10 dead-updater
+            # incident all over again, so resolve it here instead.
+            #
+            # Map the platform key to the updater artifact's filename suffix.
+            # Deliberately NOT a substring search: `_aarch64.app.tar.gz` also
+            # matches its own `.sig`, and registering the signature file as the
+            # download would break every client's update.
             if [[ -z "${URL}" || "${URL}" == "null" ]]; then
-              echo "::error::latest.json references asset '${ASSET_NAME}' (platform '${PLATFORM}'), but no such asset is attached to release ${TAG} in ${REPO}. The installer was not published to this repo — refusing to register a URL that would 404 for clients."
+              case "${PLATFORM}" in
+                darwin-aarch64*)      SUFFIX="_aarch64.app.tar.gz" ;;
+                darwin-x86_64*)       SUFFIX="_x64.app.tar.gz" ;;
+                windows-*-nsis)       SUFFIX="-setup.exe" ;;
+                windows-*)            SUFFIX="_en-US.msi" ;;
+                *) echo "::error::No filename mapping for platform '${PLATFORM}'. Add one before releasing."; exit 1 ;;
+              esac
+              MATCHES=$(jq -r --arg s "${SUFFIX}" \
+                '[.assets[] | select(.name | endswith($s))] | .[].browser_download_url' <<<"${REL}")
+              COUNT=$(grep -c . <<<"${MATCHES}" || true)
+              if [[ "${COUNT}" -ne 1 ]]; then
+                echo "::error::platform '${PLATFORM}' expected exactly one asset ending '${SUFFIX}' on ${TAG} in ${REPO}, found ${COUNT}. Refusing to guess which file clients should download."
+                exit 1
+              fi
+              URL="${MATCHES}"
+              HOW="platform→suffix ${SUFFIX}"
+            fi
+
+            if [[ -z "${URL}" || "${URL}" == "null" ]]; then
+              echo "::error::could not resolve a download URL for platform '${PLATFORM}' on ${TAG} in ${REPO}. The installer was not published to this repo — refusing to register a URL that would 404 for clients."
               exit 1
             fi
-            echo "  registering ${PLATFORM} → ${URL}"
+            echo "  registering ${PLATFORM} → ${URL}  [${HOW}]"
             curl -fsS -X POST \
               "${SUPABASE_URL}/rest/v1/rpc/register_release_version" \
               -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
