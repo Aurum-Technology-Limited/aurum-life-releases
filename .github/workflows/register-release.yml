@@ -16,16 +16,32 @@ name: Register release in update manifest
 # 404s for end users. So we register the URL of the matching asset ON THIS
 # release instead (see the re-resolve step below). Trusting the embedded URL is
 # exactly what shipped a manifest full of 404 links for v0.1.17 until it was
-# hand-patched. The signature is still read from latest.json — it signs the file
+# hand-patched. The signature is still read from latest.json: it signs the file
 # bytes, which are identical whichever repo hosts them.
 #
-# Required repo config (Settings → Secrets and variables → Actions):
+# CHANNELS. The desktop polls one of two channels, `stable` (the default) or
+# `beta` (the "Receive beta updates" toggle in Settings), and the manifest
+# serves each its own `release_channels.latest_version` pointer. Until
+# 2026-09-09 the auto path registered STABLE ONLY and left beta to a manual
+# dispatch, and that manual step was skipped on v0.1.48 and again on v0.1.49:
+# for six days beta sat at 0.1.47 while stable served 0.1.49, and every tester
+# with the toggle on was told "You're on the latest version" on a build two
+# releases old. Nothing failed, because nothing looked. So the auto path now
+# registers beta too, whenever the published version is ahead of what beta
+# serves (or beta has nothing yet). Beta exists to run AHEAD of stable and must
+# never lag it; a beta that is already ahead (a prerelease pointed there by
+# hand) is left alone, and the log says which of the three cases happened.
+#
+# Required repo config (Settings, Secrets and variables, Actions):
 #   - Variable  SUPABASE_URL                 e.g. https://sftppbnqlsumjlrgyzgo.supabase.co
 #   - Secret    SUPABASE_SERVICE_ROLE_KEY    service-role key for the RPC (write path)
 #
 # Idempotent: re-publishing a release re-registers (RPC upserts on
 # version+channel+platform). Also runnable manually for back-registering an
-# existing tag (e.g. v0.1.10).
+# existing tag. The manual `channel` input is `auto` by default, which does
+# exactly what a publish does (stable, then beta if it is behind); `stable` or
+# `beta` registers that ONE channel unconditionally, which is the tool for
+# pointing beta at a prerelease.
 
 on:
   release:
@@ -36,9 +52,14 @@ on:
         description: "Release tag to register (e.g. v0.1.10)"
         required: true
       channel:
-        description: "Channel to register into (stable or beta)"
+        description: "auto = stable, then beta if it is behind. Or exactly one of stable / beta."
         required: false
-        default: stable
+        default: auto
+        type: choice
+        options:
+          - auto
+          - stable
+          - beta
 
 jobs:
   register:
@@ -53,9 +74,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
-          # Auto (release:published) path always registers stable; manual
-          # dispatch can target beta via the `channel` input (default stable).
-          CHANNEL: ${{ inputs.channel || 'stable' }}
+          # The auto (release:published) path is `auto`: stable, then beta if it
+          # is behind. Manual dispatch may pin exactly one channel instead.
+          MODE: ${{ inputs.channel || 'auto' }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
@@ -64,44 +85,57 @@ jobs:
             echo "::error::Set the SUPABASE_URL variable and SUPABASE_SERVICE_ROLE_KEY secret on this repo."
             exit 1
           fi
+          case "${MODE}" in
+            auto|stable|beta) ;;
+            *) echo "::error::unknown channel mode '${MODE}' (auto, stable or beta)."; exit 1 ;;
+          esac
           VERSION="${TAG#v}"
-          echo "Resolving release ${TAG}…"
+          echo "Resolving release ${TAG}..."
           REL=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
             "https://api.github.com/repos/${REPO}/releases/tags/${TAG}")
 
           LJ_URL=$(jq -r '.assets[] | select(.name == "latest.json") | .browser_download_url' <<<"${REL}" | head -1)
           if [[ -z "${LJ_URL}" || "${LJ_URL}" == "null" ]]; then
-            echo "::error::No latest.json asset on ${TAG} — nothing to register."
+            echo "::error::No latest.json asset on ${TAG}. Nothing to register."
             exit 1
           fi
           LATEST=$(curl -fsSL "${LJ_URL}")
           NOTES=$(jq -r '.notes // ""' <<<"${LATEST}")
 
-          # One RPC call per platform key in latest.json. The keys are Tauri's
-          # `{{target}}` values (e.g. windows-x86_64, darwin-aarch64) — exactly
-          # what release_manifest_v1 matches on.
+          # The keys are Tauri's `{{target}}` values (e.g. windows-x86_64,
+          # darwin-aarch64), exactly what release_manifest_v1 matches on.
           PLATFORMS=$(jq -r '.platforms | keys[]' <<<"${LATEST}")
           if [[ -z "${PLATFORMS}" ]]; then
             echo "::error::latest.json has no platforms."
             exit 1
           fi
+
+          # ── Resolve every platform's download URL BEFORE touching the DB ──
+          # The `url` baked into latest.json points at whatever repo *built*
+          # the bundle: tauri-action in the PRIVATE build repo
+          # (aurum-life-desktop), whose release assets 404 for end users. This
+          # public repo is where the installers are actually published and
+          # downloadable, so register the URL of the matching asset ON THIS
+          # RELEASE instead of trusting latest.json's embedded URL.
+          #
+          # This is the fix for the class of bug where the manifest served a
+          # build-repo URL and every client's auto-update 404'd. Match by the
+          # asset filename (the tail of the embedded URL); the file contents
+          # (hence the minisign SIG) are identical across repos, so the
+          # signature is still taken from latest.json.
+          #
+          # Resolution happens for ALL platforms first, and only then does any
+          # RPC run: a platform that cannot be resolved aborts the run before a
+          # single row is written, so a channel pointer is never advanced with
+          # only some of its platforms registered (which serves 204 to the
+          # missing OS, silently).
+          KEYS=()
+          URLS=()
+          SIGS=()
           while IFS= read -r PLATFORM; do
             EMBEDDED_URL=$(jq -r --arg p "${PLATFORM}" '.platforms[$p].url' <<<"${LATEST}")
             SIG=$(jq -r --arg p "${PLATFORM}" '.platforms[$p].signature' <<<"${LATEST}")
 
-            # ── Re-resolve the download URL against THIS release's assets ──
-            # The `url` baked into latest.json points at whatever repo *built*
-            # the bundle — that's tauri-action in the PRIVATE build repo
-            # (aurum-life-desktop), whose release assets 404 for end users.
-            # This public repo is where the installers are actually published
-            # and downloadable, so register the URL of the matching asset ON
-            # THIS RELEASE instead of trusting latest.json's embedded URL.
-            #
-            # This is the fix for the class of bug where the manifest served a
-            # build-repo URL and every client's auto-update 404'd. Match by the
-            # asset filename (the tail of the embedded URL); the file contents
-            # (hence the minisign SIG) are identical across repos, so the
-            # signature is still taken from latest.json.
             # Strategy 1: the tail of the embedded URL is a filename. True only
             # when tauri-action bakes a browser_download_url.
             ASSET_NAME=$(basename "${EMBEDDED_URL}")
@@ -110,12 +144,12 @@ jobs:
             HOW="filename from latest.json url"
 
             # Strategy 2: tauri-action now bakes GitHub *API* urls
-            # (…/releases/assets/502992182), so basename yields a numeric asset
+            # (.../releases/assets/502992182), so basename yields a numeric asset
             # id that matches no filename and strategy 1 always fails. That is
-            # not hypothetical — it silently broke registration for v0.1.33 and
+            # not hypothetical: it silently broke registration for v0.1.33 and
             # v0.1.34, and each time the release sat published-but-unregistered
             # until someone noticed and ran the RPC by hand. A release nobody
-            # remembers to hand-register is the v0.1.1–v0.1.10 dead-updater
+            # remembers to hand-register is the v0.1.1 to v0.1.10 dead-updater
             # incident all over again, so resolve it here instead.
             #
             # Map the platform key to the updater artifact's filename suffix.
@@ -138,24 +172,84 @@ jobs:
                 exit 1
               fi
               URL="${MATCHES}"
-              HOW="platform→suffix ${SUFFIX}"
+              HOW="platform to suffix ${SUFFIX}"
             fi
 
             if [[ -z "${URL}" || "${URL}" == "null" ]]; then
-              echo "::error::could not resolve a download URL for platform '${PLATFORM}' on ${TAG} in ${REPO}. The installer was not published to this repo — refusing to register a URL that would 404 for clients."
+              echo "::error::could not resolve a download URL for platform '${PLATFORM}' on ${TAG} in ${REPO}. The installer was not published to this repo. Refusing to register a URL that would 404 for clients."
               exit 1
             fi
-            echo "  registering ${PLATFORM} → ${URL}  [${HOW}]"
-            curl -fsS -X POST \
-              "${SUPABASE_URL}/rest/v1/rpc/register_release_version" \
-              -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
-              -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-              -H "Content-Type: application/json" \
-              -d "$(jq -nc \
-                --arg v "${VERSION}" --arg c "${CHANNEL}" --arg p "${PLATFORM}" \
-                --arg u "${URL}" --arg s "${SIG}" --arg n "${NOTES}" \
-                '{p_version:$v, p_channel:$c, p_platform:$p, p_url:$u, p_signature:$s, p_notes:$n, p_make_live:true}')" \
-              > /dev/null
+            echo "  resolved ${PLATFORM} -> ${URL}  [${HOW}]"
+            KEYS+=("${PLATFORM}")
+            URLS+=("${URL}")
+            SIGS+=("${SIG}")
           done <<< "${PLATFORMS}"
 
-          echo "Registered ${VERSION} (${CHANNEL}) for: $(echo "${PLATFORMS}" | paste -sd', ' -)"
+          # One RPC call per platform, into the named channel. `p_make_live`
+          # advances that channel's pointer, which is the switch clients see.
+          register_channel() {
+            local CHANNEL="$1"
+            local i
+            for i in "${!KEYS[@]}"; do
+              echo "  registering ${VERSION} (${CHANNEL}) ${KEYS[$i]} -> ${URLS[$i]}"
+              curl -fsS -X POST \
+                "${SUPABASE_URL}/rest/v1/rpc/register_release_version" \
+                -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+                -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -nc \
+                  --arg v "${VERSION}" --arg c "${CHANNEL}" --arg p "${KEYS[$i]}" \
+                  --arg u "${URLS[$i]}" --arg s "${SIGS[$i]}" --arg n "${NOTES}" \
+                  '{p_version:$v, p_channel:$c, p_platform:$p, p_url:$u, p_signature:$s, p_notes:$n, p_make_live:true}')" \
+                > /dev/null
+            done
+            echo "Registered ${VERSION} (${CHANNEL}) for: $(printf '%s\n' "${KEYS[@]}" | paste -sd', ' -)"
+          }
+
+          # is_ahead A B: succeeds when semver A is strictly ahead of B.
+          # `sort -V` alone is wrong for the one case that matters here: it
+          # puts `0.1.50-beta.2` AFTER `0.1.50`, while semver (and the updater)
+          # say a GA release supersedes every prerelease of its own core. So
+          # compare the numeric cores first, and on an equal core let the
+          # version without a suffix win; two prereleases fall back to sort -V.
+          is_ahead() {
+            local a="$1" b="$2"
+            local ac="${a%%-*}" bc="${b%%-*}"
+            if [[ "${ac}" != "${bc}" ]]; then
+              [[ "$(printf '%s\n%s\n' "${ac}" "${bc}" | sort -V | tail -n1)" == "${ac}" ]]
+              return
+            fi
+            local as="${a#"${ac}"}" bs="${b#"${bc}"}"
+            if [[ -z "${as}" && -z "${bs}" ]]; then return 1; fi
+            if [[ -z "${as}" ]]; then return 0; fi
+            if [[ -z "${bs}" ]]; then return 1; fi
+            [[ "${a}" != "${b}" && "$(printf '%s\n%s\n' "${a}" "${b}" | sort -V | tail -n1)" == "${a}" ]]
+          }
+
+          case "${MODE}" in
+            stable|beta)
+              register_channel "${MODE}"
+              ;;
+            auto)
+              register_channel stable
+              # Beta: read what it serves now and advance it only if this
+              # version is ahead. The read uses the same service-role key as
+              # the RPC; RLS denies anon reads on release_channels by design.
+              BETA_LATEST=$(curl -fsS \
+                "${SUPABASE_URL}/rest/v1/release_channels?channel=eq.beta&select=latest_version" \
+                -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+                -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+                | jq -r '.[0].latest_version // ""')
+              if [[ -z "${BETA_LATEST}" ]]; then
+                echo "beta: no channel row yet; registering ${VERSION}"
+                register_channel beta
+              elif is_ahead "${VERSION}" "${BETA_LATEST}"; then
+                echo "beta: was ${BETA_LATEST}, behind ${VERSION}; registering so beta does not lag stable"
+                register_channel beta
+              elif [[ "${VERSION}" == "${BETA_LATEST}" ]]; then
+                echo "beta: already at ${VERSION}; nothing to do"
+              else
+                echo "beta: ahead at ${BETA_LATEST}; leaving it"
+              fi
+              ;;
+          esac
